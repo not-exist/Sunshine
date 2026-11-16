@@ -879,9 +879,14 @@ namespace display_device {
     if (auto settings_manager {make_settings_manager(persistence_filepath, video_config)}) {
       DD_DATA.sm_instance = std::make_unique<RetryScheduler<SettingsManagerInterface>>(std::move(settings_manager));
 
+      const auto available_devices {DD_DATA.sm_instance->execute([](auto &settings_iface) {
+        return settings_iface.enumAvailableDevices();
+      })};
+      BOOST_LOG(info) << "Currently available display devices:\n"
+                      << toJson(available_devices);
+
       // In case we have failed to revert configuration before shutting down, we should
-      // do it now. Reverting enumerates the devices itself, so do not enumerate a second
-      // time here just to log the list.
+      // do it now.
       revert_configuration_unlocked(revert_option_e::try_indefinitely);
     }
 
