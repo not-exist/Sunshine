@@ -5,8 +5,11 @@
 #pragma once
 
 // standard includes
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -34,6 +37,43 @@ namespace stream {
 }
 
 namespace video {
+
+  /**
+   * @brief One-shot readiness latch for the slow startup initialization.
+   *
+   * The HTTP and RTSP servers start before display recovery and encoder probing complete. Handlers
+   * that depend on the resulting display and encoder state wait on this latch instead of delaying
+   * every server from listening.
+   */
+  class startup_latch_t {
+  public:
+    /**
+     * @brief Mark startup initialization as finished and wake every waiter.
+     */
+    void mark_ready();
+
+    /**
+     * @brief Check whether startup initialization has finished without blocking.
+     *
+     * @return True when initialization has finished.
+     */
+    [[nodiscard]] bool is_ready() const;
+
+    /**
+     * @brief Wait for startup initialization to finish.
+     *
+     * @param timeout Maximum time to wait.
+     * @return True when initialization finished before the timeout.
+     */
+    bool wait_for(std::chrono::milliseconds timeout = std::chrono::seconds {30});
+
+  private:
+    mutable std::mutex mutex_;         ///< Guards the condition-variable wait.
+    std::condition_variable cv_;       ///< Wakes waiters when initialization finishes.
+    std::atomic<bool> ready_ {false};  ///< True once initialization has finished.
+  };
+
+  extern startup_latch_t startup_latch;  ///< Shared startup readiness latch.
 
   /**
    * @brief Encoding configuration requested by a remote client.

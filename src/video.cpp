@@ -1508,6 +1508,24 @@ namespace video {
     &software
   };
 
+  void startup_latch_t::mark_ready() {
+    ready_.store(true, std::memory_order_release);
+    cv_.notify_all();
+  }
+
+  bool startup_latch_t::is_ready() const {
+    return ready_.load(std::memory_order_acquire);
+  }
+
+  bool startup_latch_t::wait_for(std::chrono::milliseconds timeout) {
+    std::unique_lock lock {mutex_};
+    return cv_.wait_for(lock, timeout, [this] {
+      return ready_.load(std::memory_order_acquire);
+    });
+  }
+
+  startup_latch_t startup_latch;
+
   static encoder_t *chosen_encoder;
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
