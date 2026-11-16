@@ -1509,7 +1509,10 @@ namespace video {
   };
 
   void startup_latch_t::mark_ready() {
-    ready_.store(true, std::memory_order_release);
+    {
+      std::lock_guard lock {mutex_};
+      ready_.store(true, std::memory_order_release);
+    }
     cv_.notify_all();
   }
 
@@ -1525,6 +1528,27 @@ namespace video {
   }
 
   startup_latch_t startup_latch;
+
+  bool wait_for_startup_ready(std::chrono::milliseconds timeout) {
+    auto shutdown_event = mail::man->event<bool>(mail::shutdown);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    while (!startup_latch.is_ready()) {
+      if (shutdown_event->view(std::chrono::milliseconds {0})) {
+        return false;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        return false;
+      }
+
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+      startup_latch.wait_for(std::min(remaining, std::chrono::milliseconds {100}));
+    }
+
+    return true;
+  }
 
   static encoder_t *chosen_encoder;
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.

@@ -2042,7 +2042,7 @@ namespace confighttp {
 
     print_req(request);
 
-    const bool startup_ready = video::startup_latch.wait_for();
+    const bool startup_ready = video::startup_latch.is_ready();
     nlohmann::json output_tree;
     output_tree["status"] = startup_ready && display_device::reset_persistence();
     send_response(response, output_tree);

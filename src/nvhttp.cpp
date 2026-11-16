@@ -1247,7 +1247,7 @@ namespace nvhttp {
   void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
 
-    if (!video::startup_latch.wait_for()) {
+    if (!video::wait_for_startup_ready()) {
       BOOST_LOG(warning) << "Startup initialization is still running; codec capabilities may be incomplete"sv;
     }
 
@@ -1340,7 +1340,7 @@ namespace nvhttp {
   void applist(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
-    if (!video::startup_latch.wait_for()) {
+    if (!video::wait_for_startup_ready()) {
       BOOST_LOG(warning) << "Startup initialization is still running; HDR capabilities may be incomplete"sv;
     }
 
@@ -1399,7 +1399,7 @@ namespace nvhttp {
       }
     });
 
-    if (!video::startup_latch.wait_for()) {
+    if (!video::wait_for_startup_ready()) {
       tree.put("root.gamesession", 0);
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");
@@ -1520,7 +1520,7 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
-    if (!video::startup_latch.wait_for()) {
+    if (!video::wait_for_startup_ready()) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");

@@ -34,6 +34,10 @@ TEST(StartupLatchTest, MarkReadyIsIdempotent) {
   EXPECT_TRUE(latch.is_ready());
 }
 
+TEST(StartupLatchTest, WaitForStartupReadyTimesOutBeforeReady) {
+  EXPECT_FALSE(video::wait_for_startup_ready(std::chrono::milliseconds {0}));
+}
+
 TEST(StartupLatchTest, MarkReadyWakesWaiter) {
   video::startup_latch_t latch;
   std::atomic<bool> started {false};

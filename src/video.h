@@ -76,6 +76,17 @@ namespace video {
   extern startup_latch_t startup_latch;  ///< Shared startup readiness latch.
 
   /**
+   * @brief Wait for startup initialization while honoring a shutdown request.
+   *
+   * Handlers may be waiting for initialization while Sunshine is shutting down. Checking the
+   * shutdown event in short slices lets them return promptly instead of delaying shutdown.
+   *
+   * @param timeout Maximum time to wait.
+   * @return True when initialization finished before the timeout and before shutdown was requested.
+   */
+  bool wait_for_startup_ready(std::chrono::milliseconds timeout = std::chrono::seconds {30});
+
+  /**
    * @brief Encoding configuration requested by a remote client.
    */
   struct config_t {
