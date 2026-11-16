@@ -5,11 +5,9 @@
 #pragma once
 
 // standard includes
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <deque>
-#include <mutex>
+#include <latch>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -39,52 +37,33 @@ namespace stream {
 namespace video {
 
   /**
-   * @brief One-shot readiness latch for the slow startup initialization.
+   * @brief One-shot latch released when the slow startup initialization finishes.
    *
    * The HTTP and RTSP servers start before display recovery and encoder probing complete. Handlers
-   * that depend on the resulting display and encoder state wait on this latch instead of delaying
+   * that depend on the resulting display and encoder state check this latch instead of delaying
    * every server from listening.
    */
-  class startup_latch_t {
-  public:
-    /**
-     * @brief Mark startup initialization as finished and wake every waiter.
-     */
-    void mark_ready();
-
-    /**
-     * @brief Check whether startup initialization has finished without blocking.
-     *
-     * @return True when initialization has finished.
-     */
-    [[nodiscard]] bool is_ready() const;
-
-    /**
-     * @brief Wait for startup initialization to finish.
-     *
-     * @param timeout Maximum time to wait.
-     * @return True when initialization finished before the timeout.
-     */
-    bool wait_for(std::chrono::milliseconds timeout = std::chrono::seconds {30});
-
-  private:
-    mutable std::mutex mutex_;         ///< Guards the condition-variable wait.
-    std::condition_variable cv_;       ///< Wakes waiters when initialization finishes.
-    std::atomic<bool> ready_ {false};  ///< True once initialization has finished.
-  };
-
-  extern startup_latch_t startup_latch;  ///< Shared startup readiness latch.
+  extern std::latch startup_latch;  ///< Shared startup readiness latch.
 
   /**
-   * @brief Wait for startup initialization while honoring a shutdown request.
+   * @brief Check whether streaming startup initialization finished without blocking.
    *
-   * Handlers may be waiting for initialization while Sunshine is shutting down. Checking the
-   * shutdown event in short slices lets them return promptly instead of delaying shutdown.
+   * Request handlers must not act on display or encoder state while initialization is still
+   * running. The check also fails while Sunshine is shutting down, because initialization may
+   * have been skipped or interrupted.
    *
-   * @param timeout Maximum time to wait.
-   * @return True when initialization finished before the timeout and before shutdown was requested.
+   * @return True when initialization finished and shutdown was not requested.
    */
-  bool wait_for_startup_ready(std::chrono::milliseconds timeout = std::chrono::seconds {30});
+  [[nodiscard]] bool is_startup_ready();
+
+  /**
+   * @brief Check startup readiness for the supplied latch and shutdown event.
+   *
+   * @param latch Startup latch to inspect.
+   * @param shutdown_event Shutdown event to inspect.
+   * @return True when the latch is ready and shutdown was not requested.
+   */
+  [[nodiscard]] bool is_startup_ready(const std::latch &latch, const safe::event_t<bool> &shutdown_event);
 
   /**
    * @brief Encoding configuration requested by a remote client.

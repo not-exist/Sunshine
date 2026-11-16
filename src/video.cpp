@@ -1508,46 +1508,15 @@ namespace video {
     &software
   };
 
-  void startup_latch_t::mark_ready() {
-    {
-      std::lock_guard lock {mutex_};
-      ready_.store(true, std::memory_order_release);
-    }
-    cv_.notify_all();
+  std::latch startup_latch {1};
+
+  bool is_startup_ready(const std::latch &latch, const safe::event_t<bool> &shutdown_event) {
+    return latch.try_wait() && !shutdown_event.peek();
   }
 
-  bool startup_latch_t::is_ready() const {
-    return ready_.load(std::memory_order_acquire);
-  }
-
-  bool startup_latch_t::wait_for(std::chrono::milliseconds timeout) {
-    std::unique_lock lock {mutex_};
-    return cv_.wait_for(lock, timeout, [this] {
-      return ready_.load(std::memory_order_acquire);
-    });
-  }
-
-  startup_latch_t startup_latch;
-
-  bool wait_for_startup_ready(std::chrono::milliseconds timeout) {
+  bool is_startup_ready() {
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-
-    while (!startup_latch.is_ready()) {
-      if (shutdown_event->view(std::chrono::milliseconds {0})) {
-        return false;
-      }
-
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) {
-        return false;
-      }
-
-      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-      startup_latch.wait_for(std::min(remaining, std::chrono::milliseconds {100}));
-    }
-
-    return true;
+    return is_startup_ready(startup_latch, *shutdown_event);
   }
 
   static encoder_t *chosen_encoder;

@@ -1247,8 +1247,17 @@ namespace nvhttp {
   void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
 
-    if (!video::wait_for_startup_ready()) {
-      BOOST_LOG(warning) << "Startup initialization is still running; codec capabilities may be incomplete"sv;
+    if (!video::is_startup_ready()) {
+      pt::ptree error_tree;
+      error_tree.put("root.<xmlattr>.status_code", 503);
+      error_tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");
+
+      std::ostringstream data;
+      pt::write_xml(data, error_tree);
+      response->write(data.str());
+      response->close_connection_after_response = true;
+
+      return;
     }
 
     int pair_status = 0;
@@ -1340,12 +1349,6 @@ namespace nvhttp {
   void applist(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
 
-    if (!video::wait_for_startup_ready()) {
-      BOOST_LOG(warning) << "Startup initialization is still running; HDR capabilities may be incomplete"sv;
-    }
-
-    proc::refresh(config::stream.file_apps);
-
     pt::ptree tree;
 
     auto g = util::fail_guard([&tree, &response]() {
@@ -1357,6 +1360,15 @@ namespace nvhttp {
     });
 
     auto &apps = tree.add_child("root", pt::ptree {});
+
+    if (!video::is_startup_ready()) {
+      apps.put("<xmlattr>.status_code", 503);
+      apps.put("<xmlattr>.status_message", "Sunshine is still initializing");
+
+      return;
+    }
+
+    proc::refresh(config::stream.file_apps);
 
     apps.put("<xmlattr>.status_code", 200);
 
@@ -1399,7 +1411,7 @@ namespace nvhttp {
       }
     });
 
-    if (!video::wait_for_startup_ready()) {
+    if (!video::is_startup_ready()) {
       tree.put("root.gamesession", 0);
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");
@@ -1520,7 +1532,7 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
-    if (!video::wait_for_startup_ready()) {
+    if (!video::is_startup_ready()) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");
@@ -1620,6 +1632,14 @@ namespace nvhttp {
       response->write(data.str());
       response->close_connection_after_response = true;
     });
+
+    if (!video::is_startup_ready()) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");
+
+      return;
+    }
 
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);

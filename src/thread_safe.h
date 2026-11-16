@@ -167,6 +167,7 @@ namespace safe {
      * @return True when a value is available to inspect.
      */
     bool peek() const {
+      std::lock_guard lg {_lock};
       return _continue && (bool) _status;
     }
 
@@ -206,7 +207,7 @@ namespace safe {
     status_t _status {util::false_v<status_t>};
 
     std::condition_variable _cv;
-    std::mutex _lock;
+    mutable std::mutex _lock;
   };
 
   /**

@@ -733,6 +733,27 @@ namespace confighttp {
   }
 
   /**
+   * @brief Send a 503 Service Unavailable response.
+   * @param response The HTTP response object.
+   * @param error_message The error message to include in the response.
+   */
+  void service_unavailable(const resp_https_t &response, const std::string &error_message) {
+    constexpr auto code = SimpleWeb::StatusCode::server_error_service_unavailable;
+
+    nlohmann::json tree;
+    tree["status_code"] = code;
+    tree["status"] = false;
+    tree["error"] = error_message;
+
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json");
+    headers.emplace("X-Frame-Options", "DENY");
+    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+
+    response->write(code, tree.dump(), headers);
+  }
+
+  /**
    * @brief Validate the request content type and send a bad request when mismatched.
    */
   bool check_content_type(const resp_https_t &response, const req_https_t &request, const std::string_view &contentType) {
@@ -2042,7 +2063,7 @@ namespace confighttp {
 
     print_req(request);
 
-    const bool startup_ready = video::startup_latch.is_ready();
+    const bool startup_ready = video::is_startup_ready();
     nlohmann::json output_tree;
     output_tree["status"] = startup_ready && display_device::reset_persistence();
     send_response(response, output_tree);
@@ -2103,6 +2124,13 @@ namespace confighttp {
     }
 
     print_req(request);
+
+    // Restarting during startup would replace the asynchronous shutdown with the forced-shutdown
+    // timer before the main thread can finish initializing.
+    if (!video::is_startup_ready()) {
+      service_unavailable(response, "Sunshine is still initializing");
+      return;
+    }
 
     // We may not return from this call
     platf::restart();
@@ -2315,6 +2343,14 @@ namespace confighttp {
     }
 
     print_req(request);
+
+    // Activating a license updates the gamepad driver configuration, which the main thread reads
+    // while probing input devices during startup.
+    if (!video::is_startup_ready()) {
+      service_unavailable(response, "Sunshine is still initializing");
+      return;
+    }
+
     try {
       std::stringstream content;
       content << request->content.rdbuf();

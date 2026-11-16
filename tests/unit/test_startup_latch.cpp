@@ -1,57 +1,52 @@
 /**
  * @file tests/unit/test_startup_latch.cpp
- * @brief Test video::startup_latch_t.
+ * @brief Test the startup readiness gate used by request handlers.
  */
 
 // test includes
 #include "../tests_common.h"
 
 // standard includes
-#include <atomic>
-#include <chrono>
-#include <thread>
+#include <latch>
 
 // local includes
 #include <src/video.h>
 
-TEST(StartupLatchTest, WaitTimesOutBeforeReady) {
-  video::startup_latch_t latch;
-  EXPECT_FALSE(latch.is_ready());
-  EXPECT_FALSE(latch.wait_for(std::chrono::milliseconds {1}));
+TEST(StartupReadinessTest, GlobalLatchStartsNotReady) {
+  EXPECT_FALSE(video::is_startup_ready());
 }
 
-TEST(StartupLatchTest, WaitReturnsImmediatelyAfterReady) {
-  video::startup_latch_t latch;
-  latch.mark_ready();
-  EXPECT_TRUE(latch.is_ready());
-  EXPECT_TRUE(latch.wait_for(std::chrono::milliseconds {0}));
+TEST(StartupReadinessTest, NotReadyBeforeLatchRelease) {
+  std::latch latch {1};
+  safe::event_t<bool> shutdown_event;
+
+  EXPECT_FALSE(video::is_startup_ready(latch, shutdown_event));
 }
 
-TEST(StartupLatchTest, MarkReadyIsIdempotent) {
-  video::startup_latch_t latch;
-  latch.mark_ready();
-  latch.mark_ready();
-  EXPECT_TRUE(latch.is_ready());
+TEST(StartupReadinessTest, ReadyAfterLatchRelease) {
+  std::latch latch {1};
+  safe::event_t<bool> shutdown_event;
+
+  latch.count_down();
+
+  EXPECT_TRUE(video::is_startup_ready(latch, shutdown_event));
 }
 
-TEST(StartupLatchTest, WaitForStartupReadyTimesOutBeforeReady) {
-  EXPECT_FALSE(video::wait_for_startup_ready(std::chrono::milliseconds {0}));
+TEST(StartupReadinessTest, NotReadyWhenShutdownWasRequestedBeforeLatchRelease) {
+  std::latch latch {1};
+  safe::event_t<bool> shutdown_event;
+
+  shutdown_event.raise(true);
+
+  EXPECT_FALSE(video::is_startup_ready(latch, shutdown_event));
 }
 
-TEST(StartupLatchTest, MarkReadyWakesWaiter) {
-  video::startup_latch_t latch;
-  std::atomic<bool> started {false};
-  std::atomic<bool> result {false};
-  std::jthread waiter {[&] {
-    started.store(true);
-    result.store(latch.wait_for(std::chrono::seconds {5}));
-  }};
+TEST(StartupReadinessTest, NotReadyWhenShutdownWasRequestedAfterLatchRelease) {
+  std::latch latch {1};
+  safe::event_t<bool> shutdown_event;
 
-  while (!started.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds {1});
-  }
-  latch.mark_ready();
-  waiter.join();
+  latch.count_down();
+  shutdown_event.raise(true);
 
-  EXPECT_TRUE(result.load());
+  EXPECT_FALSE(video::is_startup_ready(latch, shutdown_event));
 }

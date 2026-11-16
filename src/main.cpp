@@ -3,6 +3,7 @@
  * @brief Definitions for the main entry point for Sunshine.
  */
 // standard includes
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <codecvt>
@@ -50,29 +51,21 @@
 
 using namespace std::literals;
 
-std::map<int, std::function<void()>> signal_handlers;  ///< Signal handlers.
+namespace {
+  std::atomic<int> received_shutdown_signal {0};  ///< Signal number recorded by the async-signal-safe handler.
+  static_assert(std::atomic<int>::is_always_lock_free, "The signal handler must only use a lock-free atomic");
 
-/**
- * @brief Forward a POSIX signal to the registered Sunshine handler.
- *
- * @param sig Native signal number being handled.
- */
-void on_signal_forwarder(int sig) {
-  signal_handlers.at(sig)();
-}
-
-/**
- * @brief Register the handler invoked for a POSIX signal.
- *
- * @param sig Native signal number being handled.
- * @param fn Signal handler function to install.
- */
-template<class FN>
-void on_signal(int sig, FN &&fn) {
-  signal_handlers.emplace(sig, std::forward<FN>(fn));
-
-  std::signal(sig, on_signal_forwarder);
-}
+  /**
+   * @brief Record a termination signal without performing work that is unsafe in signal context.
+   *
+   * The signal is acted upon by a dedicated thread in main(), which performs the actual shutdown.
+   *
+   * @param sig Native signal number being handled.
+   */
+  void shutdown_signal_handler(int sig) {
+    received_shutdown_signal.store(sig, std::memory_order_relaxed);
+  }
+}  // namespace
 
 /**
  * @brief Dispatch commands through a common signature, ignoring arguments each command does not need.
@@ -291,7 +284,7 @@ int main(int argc, char *argv[]) {
 #endif
 
   // The display device guard is created after the HTTP servers start so a slow display
-  // recovery does not delay the Web UI. Signal handlers clear it through this mutex.
+  // recovery does not delay the Web UI. The shutdown thread clears it through this mutex.
   std::unique_ptr<platf::deinit_t> display_device_deinit_guard;
   std::mutex display_guard_mutex;
   auto take_display_guard = [&]() {
@@ -299,16 +292,44 @@ int main(int argc, char *argv[]) {
     return std::move(display_device_deinit_guard);
   };
   auto reset_display_guard = [&]() {
-    // The signal handler must never block on this mutex: it can interrupt the main thread while
-    // the main thread holds it. try_lock leaves cleanup to the main thread in that case.
-    std::unique_lock lock {display_guard_mutex, std::try_to_lock};
-    if (!lock.owns_lock()) {
-      return;
+    // Only the shutdown thread calls this, so it may block. The guard is destroyed after the
+    // lock is released because its destructor takes libdisplaydevice's own mutex.
+    auto guard = take_display_guard();
+    guard.reset();
+  };
+  auto init_display_device = [&]() {
+    auto guard = display_device::init(platf::appdata() / "display_device.state", config::video);
+    if (!guard) {
+      BOOST_LOG(error) << "Display device session failed to initialize"sv;
     }
 
-    auto guard = std::move(display_device_deinit_guard);
-    lock.unlock();
-    guard.reset();
+    std::lock_guard lock {display_guard_mutex};
+    display_device_deinit_guard = std::move(guard);
+  };
+
+#ifdef _WIN32
+  auto apply_nvprefs_settings = [&]() {
+    // Modify relevant NVIDIA control panel settings if the system has corresponding gpu
+    if (nvprefs_instance.load()) {
+      // Restore global settings to the undo file left by improper termination of sunshine.exe
+      nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
+      // Modify application settings for sunshine.exe
+      nvprefs_instance.modify_application_profile();
+      // Modify global settings, undo file is produced in the process to restore after improper termination
+      nvprefs_instance.modify_global_profile();
+      // Unload dynamic library to survive driver re-installation
+      nvprefs_instance.unload();
+    }
+  };
+#endif
+
+  // This used to run unconditionally before the HTTP servers could be reached. Keep it on every
+  // startup path so a previous crash cannot leave the display or NVIDIA settings broken.
+  auto init_display_and_platform_settings = [&]() {
+    init_display_device();
+#ifdef _WIN32
+    apply_nvprefs_settings();
+#endif
   };
 
 #ifdef _WIN32
@@ -389,47 +410,44 @@ int main(int argc, char *argv[]) {
 
   task_pool.start(1);
 
-  // Create signal handler after logging has been initialized
+  // Create signal handling after logging has been initialized. The handler itself only records
+  // the signal: taking locks or destroying the display guard there can deadlock when the signal
+  // interrupts a thread that already holds those locks. Polling avoids waking this thread with
+  // synchronization primitives that are not async-signal-safe.
   auto shutdown_event = mail::man->event<bool>(mail::shutdown);
-  on_signal(SIGINT, [&force_shutdown, &reset_display_guard, shutdown_event]() {
-    BOOST_LOG(info) << "Interrupt handler called"sv;
+  std::signal(SIGINT, shutdown_signal_handler);
+  std::signal(SIGTERM, shutdown_signal_handler);
 
-    auto task = []() {
-      BOOST_LOG(fatal) << "10 seconds passed, yet Sunshine's still running: Forcing shutdown"sv;
-      logging::log_flush();
-      lifetime::debug_trap();
-    };
-    force_shutdown = task_pool.pushDelayed(task, 10s).task_id;
+  std::jthread shutdown_thread {[&](std::stop_token stop_token) {
+    platf::set_thread_name("shutdown");
 
-    // Break out of the main loop
-    shutdown_event->raise(true);
+    while (!stop_token.stop_requested()) {
+      const int signal_number = received_shutdown_signal.exchange(0, std::memory_order_relaxed);
+      if (!signal_number) {
+        std::this_thread::sleep_for(50ms);
+        continue;
+      }
 
-    if (tray_is_enabled && config::sunshine.system_tray) {
-      system_tray::end_tray();
+      BOOST_LOG(info) << (signal_number == SIGINT ? "Interrupt handler called"sv : "Terminate handler called"sv);
+
+      auto task = []() {
+        BOOST_LOG(fatal) << "10 seconds passed, yet Sunshine's still running: Forcing shutdown"sv;
+        logging::log_flush();
+        lifetime::debug_trap();
+      };
+      force_shutdown = task_pool.pushDelayed(task, 10s).task_id;
+
+      // Break out of the main loop
+      shutdown_event->raise(true);
+
+      if (tray_is_enabled && config::sunshine.system_tray) {
+        system_tray::end_tray();
+      }
+
+      reset_display_guard();
+      return;
     }
-
-    reset_display_guard();
-  });
-
-  on_signal(SIGTERM, [&force_shutdown, &reset_display_guard, shutdown_event]() {
-    BOOST_LOG(info) << "Terminate handler called"sv;
-
-    auto task = []() {
-      BOOST_LOG(fatal) << "10 seconds passed, yet Sunshine's still running: Forcing shutdown"sv;
-      logging::log_flush();
-      lifetime::debug_trap();
-    };
-    force_shutdown = task_pool.pushDelayed(task, 10s).task_id;
-
-    // Break out of the main loop
-    shutdown_event->raise(true);
-
-    if (tray_is_enabled && config::sunshine.system_tray) {
-      system_tray::end_tray();
-    }
-
-    reset_display_guard();
-  });
+  }};
 
 #ifdef _WIN32
   // Terminate gracefully on Windows when console window is closed
@@ -464,6 +482,8 @@ int main(int argc, char *argv[]) {
   if (http::init()) {
     BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
 
+    init_display_and_platform_settings();
+
 #ifdef _WIN32
     BOOST_LOG(fatal) << "To relaunch Sunshine successfully, use the shortcut in the Start Menu. Do not run Sunshine.exe manually."sv;
     std::this_thread::sleep_for(10s);
@@ -484,6 +504,7 @@ int main(int argc, char *argv[]) {
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
   if (shutdown_event->peek()) {
+    init_display_and_platform_settings();
     return lifetime::desired_exit_code;
   }
 
@@ -499,43 +520,23 @@ int main(int argc, char *argv[]) {
   // early returns and exceptions, so waiting request handlers cannot hang forever.
   {
     auto startup_ready_guard = util::fail_guard([&]() {
-      video::startup_latch.mark_ready();
+      video::startup_latch.count_down();
       const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startup_init_begin).count();
       BOOST_LOG(info) << "Startup: streaming initialization complete in "sv << elapsed << "ms"sv;
     });
 
-    if (!shutdown_event->peek()) {
-      {
-        auto guard = display_device::init(platf::appdata() / "display_device.state", config::video);
-        if (!guard) {
-          BOOST_LOG(error) << "Display device session failed to initialize"sv;
-        }
+    // Perform the display recovery even when shutdown was already requested. It used to run
+    // unconditionally before the Web UI could be reached, and skipping it can leave the display
+    // in the state left by a previous crash.
+    init_display_and_platform_settings();
 
-        {
-          std::lock_guard lock {display_guard_mutex};
-          display_device_deinit_guard = std::move(guard);
-        }
-
-        if (shutdown_event->peek()) {
-          auto guard = take_display_guard();
-          guard.reset();
-        }
-      }
-
-#ifdef _WIN32
-      // Modify relevant NVIDIA control panel settings if the system has corresponding gpu
-      if (nvprefs_instance.load()) {
-        // Restore global settings to the undo file left by improper termination of sunshine.exe
-        nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
-        // Modify application settings for sunshine.exe
-        nvprefs_instance.modify_application_profile();
-        // Modify global settings, undo file is produced in the process to restore after improper termination
-        nvprefs_instance.modify_global_profile();
-        // Unload dynamic library to survive driver re-installation
-        nvprefs_instance.unload();
-      }
-#endif
-
+    if (shutdown_event->peek()) {
+      // Do not probe encoders or input devices while shutting down. Probing after the display
+      // guard has been released bypasses the no-active-device protection and can delay exit
+      // past the forced-shutdown deadline.
+      auto guard = take_display_guard();
+      guard.reset();
+    } else {
       if (config::input.controller && input::probe_gamepads()) {
         BOOST_LOG(warning) << "No gamepad input is available"sv;
       }
@@ -543,6 +544,13 @@ int main(int argc, char *argv[]) {
       if (video::probe_encoders()) {
         BOOST_LOG(error) << "Video failed to find working encoder"sv;
       }
+    }
+
+    if (shutdown_event->peek()) {
+      // Shutdown may have been requested while probing. Release the display guard now instead of
+      // waiting for the end of main.
+      auto guard = take_display_guard();
+      guard.reset();
     }
   }
 
@@ -613,6 +621,9 @@ int main(int argc, char *argv[]) {
 
   task_pool.stop();
   task_pool.join();
+
+  // Stop polling for signals before the platform and display guards are destroyed.
+  shutdown_thread.request_stop();
 
 #ifdef _WIN32
   // Restore global NVIDIA control panel settings
