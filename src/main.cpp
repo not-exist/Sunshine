@@ -4,12 +4,14 @@
  */
 // standard includes
 #include <cerrno>
+#include <chrono>
 #include <codecvt>
 #include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 
 // platform includes
 #ifdef __APPLE__
@@ -288,27 +290,16 @@ int main(int argc, char *argv[]) {
   config::select_all_gamepad_drivers_if_licensed(lvh::get_license_status().license.licensed());
 #endif
 
-  // Adding guard here first as it also performs recovery after crash,
-  // otherwise people could theoretically end up without display output.
-  // It also should be destroyed before forced shutdown to expedite the cleanup.
-  auto display_device_deinit_guard = display_device::init(platf::appdata() / "display_device.state", config::video);
-  if (!display_device_deinit_guard) {
-    BOOST_LOG(error) << "Display device session failed to initialize"sv;
-  }
+  // The display device guard is created after the HTTP servers start so a slow display
+  // recovery does not delay the Web UI. Signal handlers clear it through this mutex.
+  std::unique_ptr<platf::deinit_t> display_device_deinit_guard;
+  std::mutex display_guard_mutex;
+  auto reset_display_guard = [&]() {
+    std::lock_guard lock {display_guard_mutex};
+    display_device_deinit_guard.reset();
+  };
 
 #ifdef _WIN32
-  // Modify relevant NVIDIA control panel settings if the system has corresponding gpu
-  if (nvprefs_instance.load()) {
-    // Restore global settings to the undo file left by improper termination of sunshine.exe
-    nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
-    // Modify application settings for sunshine.exe
-    nvprefs_instance.modify_application_profile();
-    // Modify global settings, undo file is produced in the process to restore after improper termination
-    nvprefs_instance.modify_global_profile();
-    // Unload dynamic library to survive driver re-installation
-    nvprefs_instance.unload();
-  }
-
   // Wait as long as possible to terminate Sunshine.exe during logoff/shutdown
   SetProcessShutdownParameters(0x100, SHUTDOWN_NORETRY);
 
@@ -388,7 +379,7 @@ int main(int argc, char *argv[]) {
 
   // Create signal handler after logging has been initialized
   auto shutdown_event = mail::man->event<bool>(mail::shutdown);
-  on_signal(SIGINT, [&force_shutdown, &display_device_deinit_guard, shutdown_event]() {
+  on_signal(SIGINT, [&force_shutdown, &reset_display_guard, shutdown_event]() {
     BOOST_LOG(info) << "Interrupt handler called"sv;
 
     auto task = []() {
@@ -405,10 +396,10 @@ int main(int argc, char *argv[]) {
       system_tray::end_tray();
     }
 
-    display_device_deinit_guard = nullptr;
+    reset_display_guard();
   });
 
-  on_signal(SIGTERM, [&force_shutdown, &display_device_deinit_guard, shutdown_event]() {
+  on_signal(SIGTERM, [&force_shutdown, &reset_display_guard, shutdown_event]() {
     BOOST_LOG(info) << "Terminate handler called"sv;
 
     auto task = []() {
@@ -425,7 +416,7 @@ int main(int argc, char *argv[]) {
       system_tray::end_tray();
     }
 
-    display_device_deinit_guard = nullptr;
+    reset_display_guard();
   });
 
 #ifdef _WIN32
@@ -458,14 +449,6 @@ int main(int argc, char *argv[]) {
   reed_solomon_init();
   auto input_deinit_guard = input::init();
 
-  if (config::input.controller && input::probe_gamepads()) {
-    BOOST_LOG(warning) << "No gamepad input is available"sv;
-  }
-
-  if (video::probe_encoders()) {
-    BOOST_LOG(error) << "Video failed to find working encoder"sv;
-  }
-
   if (http::init()) {
     BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
 
@@ -495,6 +478,57 @@ int main(int argc, char *argv[]) {
   std::jthread httpThread {nvhttp::start};
   std::jthread configThread {confighttp::start};
   std::jthread rtspThread {rtsp_stream::start};
+
+  BOOST_LOG(info) << "Startup: HTTP servers listening; continuing display and encoder initialization"sv;
+
+  const auto startup_init_begin = std::chrono::steady_clock::now();
+
+  // Keep the latch scope small: the guard marks startup ready when this block exits, including
+  // early returns and exceptions, so waiting request handlers cannot hang forever.
+  {
+    auto startup_ready_guard = util::fail_guard([&]() {
+      video::startup_latch.mark_ready();
+      const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startup_init_begin).count();
+      BOOST_LOG(info) << "Startup: streaming initialization complete in "sv << elapsed << "ms"sv;
+    });
+
+    if (!shutdown_event->peek()) {
+      {
+        auto guard = display_device::init(platf::appdata() / "display_device.state", config::video);
+        if (!guard) {
+          BOOST_LOG(error) << "Display device session failed to initialize"sv;
+        }
+
+        std::lock_guard lock {display_guard_mutex};
+        display_device_deinit_guard = std::move(guard);
+        if (shutdown_event->peek()) {
+          display_device_deinit_guard.reset();
+        }
+      }
+
+#ifdef _WIN32
+      // Modify relevant NVIDIA control panel settings if the system has corresponding gpu
+      if (nvprefs_instance.load()) {
+        // Restore global settings to the undo file left by improper termination of sunshine.exe
+        nvprefs_instance.restore_from_and_delete_undo_file_if_exists();
+        // Modify application settings for sunshine.exe
+        nvprefs_instance.modify_application_profile();
+        // Modify global settings, undo file is produced in the process to restore after improper termination
+        nvprefs_instance.modify_global_profile();
+        // Unload dynamic library to survive driver re-installation
+        nvprefs_instance.unload();
+      }
+#endif
+
+      if (config::input.controller && input::probe_gamepads()) {
+        BOOST_LOG(warning) << "No gamepad input is available"sv;
+      }
+
+      if (video::probe_encoders()) {
+        BOOST_LOG(error) << "Video failed to find working encoder"sv;
+      }
+    }
+  }
 
 #ifdef _WIN32
   // If we're using the default port and GameStream is enabled, warn the user
@@ -571,6 +605,11 @@ int main(int argc, char *argv[]) {
     nvprefs_instance.unload();
   }
 #endif
+
+  {
+    std::lock_guard lock {display_guard_mutex};
+    display_device_deinit_guard.reset();
+  }
 
   return lifetime::desired_exit_code;
 }
