@@ -62,6 +62,7 @@
 #include "system_tray.h"
 #include "utility.h"
 #include "uuid.h"
+#include "video.h"
 
 using namespace std::literals;
 
@@ -2041,8 +2042,9 @@ namespace confighttp {
 
     print_req(request);
 
+    const bool startup_ready = video::startup_latch.wait_for();
     nlohmann::json output_tree;
-    output_tree["status"] = display_device::reset_persistence();
+    output_tree["status"] = startup_ready && display_device::reset_persistence();
     send_response(response, output_tree);
   }
 
