@@ -410,6 +410,7 @@
     "qsv_preset_veryfast": "fastest (lowest quality)",
     "qsv_slow_hevc": "Allow Slow HEVC Encoding",
     "qsv_slow_hevc_desc": "This can enable HEVC encoding on older Intel GPUs, at the cost of higher GPU usage and worse performance.",
+    "restart_failed": "The configuration was saved, but Sunshine is still starting and could not restart yet. Restart Sunshine or apply the changes again once it finishes starting.",
     "restart_note": "Sunshine is restarting to apply changes.",
     "search_options": "Search configuration options...",
     "stream_audio": "Stream Audio",

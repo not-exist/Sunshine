@@ -7,46 +7,83 @@
 #include "../tests_common.h"
 
 // standard includes
-#include <latch>
+#include <memory>
 
 // local includes
 #include <src/video.h>
 
-TEST(StartupReadinessTest, GlobalLatchStartsNotReady) {
-  EXPECT_FALSE(video::is_startup_ready());
-}
+namespace {
+  /**
+   * @brief Reset the process-wide readiness state around each test.
+   */
+  class StartupReadinessTest: public BaseTest {
+  protected:
+    /**
+     * @brief Clear readiness and any cached shutdown event before the test.
+     */
+    void SetUp() override {
+      BaseTest::SetUp();
+      video::set_startup_ready_for_testing(false);
+    }
 
-TEST(StartupReadinessTest, NotReadyBeforeLatchRelease) {
-  std::latch latch {1};
-  safe::event_t<bool> shutdown_event;
+    /**
+     * @brief Clear readiness and any cached shutdown event after the test.
+     */
+    void TearDown() override {
+      video::set_startup_ready_for_testing(false);
+      BaseTest::TearDown();
+    }
+  };
 
-  EXPECT_FALSE(video::is_startup_ready(latch, shutdown_event));
-}
+  TEST_F(StartupReadinessTest, GlobalStateStartsNotReady) {
+    EXPECT_FALSE(video::is_startup_ready());
+  }
 
-TEST(StartupReadinessTest, ReadyAfterLatchRelease) {
-  std::latch latch {1};
-  safe::event_t<bool> shutdown_event;
+  TEST_F(StartupReadinessTest, NotReadyBeforeStartupFinishes) {
+    safe::event_t<bool> shutdown_event;
 
-  latch.count_down();
+    EXPECT_FALSE(video::is_startup_ready(false, shutdown_event));
+  }
 
-  EXPECT_TRUE(video::is_startup_ready(latch, shutdown_event));
-}
+  TEST_F(StartupReadinessTest, ReadyWhenStartupFinishedAndShutdownNotRequested) {
+    safe::event_t<bool> shutdown_event;
 
-TEST(StartupReadinessTest, NotReadyWhenShutdownWasRequestedBeforeLatchRelease) {
-  std::latch latch {1};
-  safe::event_t<bool> shutdown_event;
+    EXPECT_TRUE(video::is_startup_ready(true, shutdown_event));
+  }
 
-  shutdown_event.raise(true);
+  TEST_F(StartupReadinessTest, NotReadyWhenShutdownRequestedAfterStartupFinished) {
+    safe::event_t<bool> shutdown_event;
+    shutdown_event.raise(true);
 
-  EXPECT_FALSE(video::is_startup_ready(latch, shutdown_event));
-}
+    EXPECT_FALSE(video::is_startup_ready(true, shutdown_event));
+  }
 
-TEST(StartupReadinessTest, NotReadyWhenShutdownWasRequestedAfterLatchRelease) {
-  std::latch latch {1};
-  safe::event_t<bool> shutdown_event;
+  TEST_F(StartupReadinessTest, GlobalReadyWithoutShutdownEvent) {
+    video::mark_startup_ready();
 
-  latch.count_down();
-  shutdown_event.raise(true);
+    EXPECT_TRUE(video::is_startup_ready());
+  }
 
-  EXPECT_FALSE(video::is_startup_ready(latch, shutdown_event));
-}
+  TEST_F(StartupReadinessTest, TestingSetterCanMarkReady) {
+    video::set_startup_ready_for_testing(true);
+
+    EXPECT_TRUE(video::is_startup_ready());
+  }
+
+  TEST_F(StartupReadinessTest, GlobalReadyWhileShutdownEventIsInactive) {
+    auto shutdown_event = std::make_shared<safe::event_t<bool>>();
+    video::set_shutdown_event(shutdown_event);
+    video::mark_startup_ready();
+
+    EXPECT_TRUE(video::is_startup_ready());
+  }
+
+  TEST_F(StartupReadinessTest, GlobalNotReadyAfterShutdownWasRaised) {
+    auto shutdown_event = std::make_shared<safe::event_t<bool>>();
+    video::set_shutdown_event(shutdown_event);
+    video::mark_startup_ready();
+    shutdown_event->raise(true);
+
+    EXPECT_FALSE(video::is_startup_ready());
+  }
+}  // namespace

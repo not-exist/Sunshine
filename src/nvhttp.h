@@ -393,6 +393,69 @@ namespace nvhttp {
    */
   namespace test_support {
     /**
+     * @brief Run the production server-info handler for HTTPS startup-gate tests.
+     *
+     * @param response HTTP response object to populate.
+     * @param request HTTP request data from the test client.
+     */
+    void serverinfo_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Run the production app-list handler for HTTPS startup-gate tests.
+     *
+     * @param response HTTP response object to populate.
+     * @param request HTTP request data from the test client.
+     */
+    void applist_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Run the production launch handler for HTTPS startup-gate tests.
+     *
+     * @param response HTTP response object to populate.
+     * @param request HTTP request data from the test client.
+     */
+    void launch_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Run the production resume handler for HTTPS startup-gate tests.
+     *
+     * @param response HTTP response object to populate.
+     * @param request HTTP request data from the test client.
+     */
+    void resume_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Run the production cancel handler for HTTPS startup-gate tests.
+     *
+     * @param response HTTP response object to populate.
+     * @param request HTTP request data from the test client.
+     */
+    void cancel_https(
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Response> response,
+      std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request> request
+    );
+
+    /**
+     * @brief Build the startup-not-ready response tree for tree-level tests.
+     *
+     * @param node_name Optional per-endpoint response node to set to zero.
+     * @return Property tree with the 503 status and message.
+     */
+    boost::property_tree::ptree startup_not_ready_tree_for_testing(std::string_view node_name = {});
+
+    /**
      * @brief Create the production HTTPS server and expose its callback lifetime guard.
      *
      * @param certificate_file Path to the server certificate PEM file.

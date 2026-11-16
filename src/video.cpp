@@ -9,6 +9,8 @@
 #include <bitset>
 #include <deque>
 #include <list>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -1508,15 +1510,42 @@ namespace video {
     &software
   };
 
-  std::latch startup_latch {1};
+  namespace {
+    std::atomic<bool> startup_initialization_finished {false};  ///< Whether the slow startup initialization finished.
+    std::mutex shutdown_event_mutex;  ///< Protects the cached shutdown event handle.
+    std::shared_ptr<safe::event_t<bool>> startup_shutdown_event;  ///< Shutdown event used by readiness checks.
+  }
 
-  bool is_startup_ready(const std::latch &latch, const safe::event_t<bool> &shutdown_event) {
-    return latch.try_wait() && !shutdown_event.peek();
+  void set_shutdown_event(std::shared_ptr<safe::event_t<bool>> shutdown_event) {
+    std::lock_guard lock {shutdown_event_mutex};
+    startup_shutdown_event = std::move(shutdown_event);
+  }
+
+  void mark_startup_ready() {
+    startup_initialization_finished.store(true, std::memory_order_release);
+  }
+
+#ifdef SUNSHINE_TESTS
+  void set_startup_ready_for_testing(const bool ready) {
+    startup_initialization_finished.store(ready, std::memory_order_release);
+    if (!ready) {
+      std::lock_guard lock {shutdown_event_mutex};
+      startup_shutdown_event.reset();
+    }
+  }
+#endif
+
+  bool is_startup_ready(const bool startup_ready, const safe::event_t<bool> &shutdown_event) {
+    return startup_ready && !shutdown_event.peek();
   }
 
   bool is_startup_ready() {
-    auto shutdown_event = mail::man->event<bool>(mail::shutdown);
-    return is_startup_ready(startup_latch, *shutdown_event);
+    if (!startup_initialization_finished.load(std::memory_order_acquire)) {
+      return false;
+    }
+
+    std::lock_guard lock {shutdown_event_mutex};
+    return !startup_shutdown_event || !startup_shutdown_event->peek();
   }
 
   static encoder_t *chosen_encoder;

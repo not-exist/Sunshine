@@ -46,9 +46,24 @@ using namespace std::literals;
 namespace nvhttp {
 
   static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Sunshine. Moonlight-qt will report Malformed XML (missing root element)."sv;
+  static constexpr std::string_view STARTUP_NOT_READY_MESSAGE = "Sunshine is still initializing"sv;
 
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
+
+  /**
+   * @brief Populate a GameStream response tree with the startup-not-ready error.
+   *
+   * @param tree Property tree to populate.
+   * @param node_name Optional per-endpoint response node to set to zero.
+   */
+  void put_startup_not_ready(pt::ptree &tree, const std::string_view node_name = {}) {
+    if (!node_name.empty()) {
+      tree.put(std::string {node_name}, 0);
+    }
+    tree.put("root.<xmlattr>.status_code", 503);
+    tree.put("root.<xmlattr>.status_message", std::string {STARTUP_NOT_READY_MESSAGE});
+  }
 
   crypto::cert_chain_t cert_chain;  ///< Enabled paired-client certificates accepted by Sunshine's GameStream HTTPS server.
 
@@ -1249,8 +1264,7 @@ namespace nvhttp {
 
     if (!video::is_startup_ready()) {
       pt::ptree error_tree;
-      error_tree.put("root.<xmlattr>.status_code", 503);
-      error_tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");
+      put_startup_not_ready(error_tree);
 
       std::ostringstream data;
       pt::write_xml(data, error_tree);
@@ -1362,9 +1376,7 @@ namespace nvhttp {
     auto &apps = tree.add_child("root", pt::ptree {});
 
     if (!video::is_startup_ready()) {
-      apps.put("<xmlattr>.status_code", 503);
-      apps.put("<xmlattr>.status_message", "Sunshine is still initializing");
-
+      put_startup_not_ready(tree);
       return;
     }
 
@@ -1412,10 +1424,7 @@ namespace nvhttp {
     });
 
     if (!video::is_startup_ready()) {
-      tree.put("root.gamesession", 0);
-      tree.put("root.<xmlattr>.status_code", 503);
-      tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");
-
+      put_startup_not_ready(tree, "root.gamesession");
       return;
     }
 
@@ -1533,10 +1542,7 @@ namespace nvhttp {
     });
 
     if (!video::is_startup_ready()) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 503);
-      tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");
-
+      put_startup_not_ready(tree, "root.resume");
       return;
     }
 
@@ -1634,10 +1640,7 @@ namespace nvhttp {
     });
 
     if (!video::is_startup_ready()) {
-      tree.put("root.cancel", 0);
-      tree.put("root.<xmlattr>.status_code", 503);
-      tree.put("root.<xmlattr>.status_message", "Sunshine is still initializing");
-
+      put_startup_not_ready(tree, "root.cancel");
       return;
     }
 
@@ -1897,6 +1900,34 @@ namespace nvhttp {
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
+    void serverinfo_https(resp_https_t response, req_https_t request) {
+      serverinfo<SunshineHTTPS>(std::move(response), std::move(request));
+    }
+
+    void applist_https(resp_https_t response, req_https_t request) {
+      applist(std::move(response), std::move(request));
+    }
+
+    void launch_https(resp_https_t response, req_https_t request) {
+      static bool host_audio = false;
+      launch(host_audio, std::move(response), std::move(request));
+    }
+
+    void resume_https(resp_https_t response, req_https_t request) {
+      static bool host_audio = false;
+      resume(host_audio, std::move(response), std::move(request));
+    }
+
+    void cancel_https(resp_https_t response, req_https_t request) {
+      cancel(std::move(response), std::move(request));
+    }
+
+    pt::ptree startup_not_ready_tree_for_testing(const std::string_view node_name) {
+      pt::ptree tree;
+      put_startup_not_ready(tree, node_name);
+      return tree;
+    }
+
     std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_https_server(
       const std::string &certificate_file,
       const std::string &private_key_file,

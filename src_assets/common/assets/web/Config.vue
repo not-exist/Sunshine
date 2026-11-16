@@ -82,6 +82,9 @@
           <div class="alert alert-success mb-4" v-if="restarted">
             <b>{{ $t('_common.success') }}</b> {{ $t('config.restart_note') }}
           </div>
+          <div class="alert alert-warning mb-4" v-if="restartFailed">
+            <b>{{ $t('_common.warning') }}</b> {{ $t('config.restart_failed') }}
+          </div>
 
       <!-- General Tab -->
       <general
@@ -220,6 +223,7 @@
         platform: "",
         saved: false,
         restarted: false,
+        restartFailed: false,
         config: null,
         currentTab: "general",
         searchQuery: "",
@@ -369,7 +373,7 @@
         });
       },
       apply() {
-        this.saved = this.restarted = false;
+        this.saved = this.restarted = this.restartFailed = false;
         let saved = this.save();
 
         saved.then((result) => {
@@ -382,6 +386,13 @@
               method: "POST",
               headers: {
                 "Content-Type": "application/json"
+              }
+            }).then((response) => {
+              if (response.status === 503) {
+                // The server is still starting, so the restart was rejected. The configuration
+                // is saved but will not be applied until Sunshine restarts.
+                this.restarted = false;
+                this.restartFailed = true;
               }
             });
           }

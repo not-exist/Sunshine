@@ -7,12 +7,15 @@
 #include <cerrno>
 #include <chrono>
 #include <codecvt>
+#include <condition_variable>
 #include <csignal>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <stop_token>
 
 // platform includes
 #ifdef __APPLE__
@@ -26,6 +29,10 @@
   #include "platform/linux/misc.h"
 
   #include <sys/auxv.h>
+#endif
+#ifndef _WIN32
+  #include <fcntl.h>
+  #include <unistd.h>
 #endif
 
 // lib includes
@@ -55,15 +62,43 @@ namespace {
   std::atomic<int> received_shutdown_signal {0};  ///< Signal number recorded by the async-signal-safe handler.
   static_assert(std::atomic<int>::is_always_lock_free, "The signal handler must only use a lock-free atomic");
 
+#ifdef _WIN32
+  HANDLE shutdown_wakeup_event = nullptr;  ///< Auto-reset event used to wake the shutdown thread.
+#else
+  int shutdown_wakeup_pipe[2] = {-1, -1};  ///< Self-pipe used to wake the shutdown thread without polling.
+#endif
+
+  /**
+   * @brief Wake the dedicated shutdown thread from signal or request-stop context.
+   */
+  void wake_shutdown_thread() {
+#ifdef _WIN32
+    if (shutdown_wakeup_event) {
+      SetEvent(shutdown_wakeup_event);
+    }
+#else
+    // write() is async-signal-safe. A full pipe only means a wakeup is already pending.
+    if (shutdown_wakeup_pipe[1] >= 0) {
+      const char token = 1;
+      (void) !::write(shutdown_wakeup_pipe[1], &token, sizeof(token));
+    }
+#endif
+  }
+
   /**
    * @brief Record a termination signal without performing work that is unsafe in signal context.
    *
    * The signal is acted upon by a dedicated thread in main(), which performs the actual shutdown.
+   * The wakeup keeps that thread event-driven instead of polling for signals.
    *
    * @param sig Native signal number being handled.
    */
   void shutdown_signal_handler(int sig) {
+    // write() may clobber errno in the interrupted thread; restore it before returning.
+    const int saved_errno = errno;
     received_shutdown_signal.store(sig, std::memory_order_relaxed);
+    wake_shutdown_thread();
+    errno = saved_errno;
   }
 }  // namespace
 
@@ -284,9 +319,13 @@ int main(int argc, char *argv[]) {
 #endif
 
   // The display device guard is created after the HTTP servers start so a slow display
-  // recovery does not delay the Web UI. The shutdown thread clears it through this mutex.
+  // recovery does not delay the Web UI. The shutdown thread clears it through these mutexes.
   std::unique_ptr<platf::deinit_t> display_device_deinit_guard;
   std::mutex display_guard_mutex;
+  // Serializes guard teardown against encoder and input probing. Probing must not run after the
+  // guard is destroyed, because a reverted display yields an empty device list that bypasses the
+  // no-active-device protection in video::allow_encoder_probing().
+  std::mutex startup_probe_mutex;
   auto take_display_guard = [&]() {
     std::lock_guard lock {display_guard_mutex};
     return std::move(display_device_deinit_guard);
@@ -294,6 +333,7 @@ int main(int argc, char *argv[]) {
   auto reset_display_guard = [&]() {
     // Only the shutdown thread calls this, so it may block. The guard is destroyed after the
     // lock is released because its destructor takes libdisplaydevice's own mutex.
+    std::lock_guard probe_lock {startup_probe_mutex};
     auto guard = take_display_guard();
     guard.reset();
   };
@@ -331,6 +371,27 @@ int main(int argc, char *argv[]) {
     apply_nvprefs_settings();
 #endif
   };
+
+  // Run the recovery even when an exception unwinds main before the startup block reaches it
+  // (for example when thread creation fails), matching the old unconditional behavior.
+  bool display_recovery_started = false;
+  auto initialize_display = [&]() {
+    display_recovery_started = true;
+    init_display_and_platform_settings();
+  };
+  auto display_recovery_guard = util::fail_guard([&]() {
+    if (display_recovery_started) {
+      return;
+    }
+
+    try {
+      init_display_and_platform_settings();
+    } catch (const std::exception &e) {
+      BOOST_LOG(error) << "Display recovery failed during shutdown: "sv << e.what();
+    } catch (...) {
+      BOOST_LOG(error) << "Display recovery failed during shutdown"sv;
+    }
+  });
 
 #ifdef _WIN32
   // Wait as long as possible to terminate Sunshine.exe during logoff/shutdown
@@ -410,25 +471,111 @@ int main(int argc, char *argv[]) {
 
   task_pool.start(1);
 
+  // The shutdown thread waits for the startup block before arming the forced-shutdown timer, so a
+  // slow display recovery can complete instead of being killed with the display left reverted.
+  std::mutex startup_completion_mutex;
+  std::condition_variable startup_completion_cv;
+  std::atomic<bool> startup_completed {false};
+  auto mark_startup_completed = [&]() {
+    {
+      std::lock_guard lock {startup_completion_mutex};
+      startup_completed.store(true, std::memory_order_release);
+    }
+    startup_completion_cv.notify_all();
+  };
+
   // Create signal handling after logging has been initialized. The handler itself only records
-  // the signal: taking locks or destroying the display guard there can deadlock when the signal
-  // interrupts a thread that already holds those locks. Polling avoids waking this thread with
-  // synchronization primitives that are not async-signal-safe.
+  // the signal and wakes this thread through a self-pipe or event: taking locks or destroying the
+  // display guard in signal context can deadlock when the signal interrupts a thread that already
+  // holds those locks, and those primitives are not async-signal-safe.
   auto shutdown_event = mail::man->event<bool>(mail::shutdown);
+  video::set_shutdown_event(shutdown_event);
+
+  bool shutdown_wakeup_available = false;
+#ifdef _WIN32
+  shutdown_wakeup_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  shutdown_wakeup_available = shutdown_wakeup_event != nullptr;
+  if (!shutdown_wakeup_available) {
+    BOOST_LOG(warning) << "Failed to create the shutdown wakeup event: "sv << GetLastError();
+  }
+#else
+  if (::pipe(shutdown_wakeup_pipe) == 0) {
+    for (const int fd : shutdown_wakeup_pipe) {
+      const int flags = ::fcntl(fd, F_GETFD);
+      if (flags >= 0) {
+        ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+      }
+    }
+    // The signal handler writes to this pipe, so a full pipe must not block it.
+    const int write_flags = ::fcntl(shutdown_wakeup_pipe[1], F_GETFL);
+    if (write_flags >= 0) {
+      ::fcntl(shutdown_wakeup_pipe[1], F_SETFL, write_flags | O_NONBLOCK);
+    }
+    shutdown_wakeup_available = true;
+  } else {
+    BOOST_LOG(warning) << "Failed to create the shutdown wakeup pipe: "sv << std::strerror(errno);
+    shutdown_wakeup_pipe[0] = -1;
+    shutdown_wakeup_pipe[1] = -1;
+  }
+#endif
+
   std::signal(SIGINT, shutdown_signal_handler);
   std::signal(SIGTERM, shutdown_signal_handler);
 
   std::jthread shutdown_thread {[&](std::stop_token stop_token) {
     platf::set_thread_name("shutdown");
 
+    // Wake the blocking wait when a stop is requested so the thread can be joined from any exit
+    // path, including early returns that only destroy the jthread.
+    std::stop_callback wake_on_stop {stop_token, []() {
+      wake_shutdown_thread();
+    }};
+
+    auto wait_for_wakeup = [&]() {
+      if (!shutdown_wakeup_available) {
+        std::this_thread::sleep_for(50ms);
+        return;
+      }
+
+#ifdef _WIN32
+      WaitForSingleObject(shutdown_wakeup_event, INFINITE);
+#else
+      char token;
+      while (::read(shutdown_wakeup_pipe[0], &token, sizeof(token)) < 0 && errno == EINTR) {}
+#endif
+    };
+
     while (!stop_token.stop_requested()) {
+      wait_for_wakeup();
+
+      if (stop_token.stop_requested()) {
+        return;
+      }
+
       const int signal_number = received_shutdown_signal.exchange(0, std::memory_order_relaxed);
       if (!signal_number) {
-        std::this_thread::sleep_for(50ms);
+        // Woken by request_stop() or a duplicate wakeup.
         continue;
       }
 
       BOOST_LOG(info) << (signal_number == SIGINT ? "Interrupt handler called"sv : "Terminate handler called"sv);
+
+      // Break out of the main loop immediately so handlers and the startup block stop using
+      // display and encoder state.
+      shutdown_event->raise(true);
+
+      // Arm the forced-shutdown timer only after startup initialization finishes, or after a
+      // bounded grace period when initialization is stuck. Waking periodically lets request_stop()
+      // interrupt the wait when the process is exiting through an early-return path.
+      {
+        std::unique_lock lock {startup_completion_mutex};
+        const auto startup_deadline = std::chrono::steady_clock::now() + 10s;
+        while (!startup_completed.load(std::memory_order_acquire) &&
+               !stop_token.stop_requested() &&
+               std::chrono::steady_clock::now() < startup_deadline) {
+          startup_completion_cv.wait_for(lock, 100ms);
+        }
+      }
 
       auto task = []() {
         BOOST_LOG(fatal) << "10 seconds passed, yet Sunshine's still running: Forcing shutdown"sv;
@@ -436,9 +583,6 @@ int main(int argc, char *argv[]) {
         lifetime::debug_trap();
       };
       force_shutdown = task_pool.pushDelayed(task, 10s).task_id;
-
-      // Break out of the main loop
-      shutdown_event->raise(true);
 
       if (tray_is_enabled && config::sunshine.system_tray) {
         system_tray::end_tray();
@@ -482,7 +626,7 @@ int main(int argc, char *argv[]) {
   if (http::init()) {
     BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
 
-    init_display_and_platform_settings();
+    initialize_display();
 
 #ifdef _WIN32
     BOOST_LOG(fatal) << "To relaunch Sunshine successfully, use the shortcut in the Start Menu. Do not run Sunshine.exe manually."sv;
@@ -504,7 +648,7 @@ int main(int argc, char *argv[]) {
 
   // FIXME: Temporary workaround: Simple-Web_server needs to be updated or replaced
   if (shutdown_event->peek()) {
-    init_display_and_platform_settings();
+    initialize_display();
     return lifetime::desired_exit_code;
   }
 
@@ -516,11 +660,12 @@ int main(int argc, char *argv[]) {
 
   const auto startup_init_begin = std::chrono::steady_clock::now();
 
-  // Keep the latch scope small: the guard marks startup ready when this block exits, including
-  // early returns and exceptions, so waiting request handlers cannot hang forever.
+  // Keep the readiness scope small: the guard marks startup ready when this block exits,
+  // including early returns and exceptions, so request handlers never stay gated forever.
   {
     auto startup_ready_guard = util::fail_guard([&]() {
-      video::startup_latch.count_down();
+      video::mark_startup_ready();
+      mark_startup_completed();
       const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startup_init_begin).count();
       BOOST_LOG(info) << "Startup: streaming initialization complete in "sv << elapsed << "ms"sv;
     });
@@ -528,29 +673,38 @@ int main(int argc, char *argv[]) {
     // Perform the display recovery even when shutdown was already requested. It used to run
     // unconditionally before the Web UI could be reached, and skipping it can leave the display
     // in the state left by a previous crash.
-    init_display_and_platform_settings();
+    initialize_display();
 
-    if (shutdown_event->peek()) {
-      // Do not probe encoders or input devices while shutting down. Probing after the display
-      // guard has been released bypasses the no-active-device protection and can delay exit
-      // past the forced-shutdown deadline.
-      auto guard = take_display_guard();
-      guard.reset();
-    } else {
-      if (config::input.controller && input::probe_gamepads()) {
-        BOOST_LOG(warning) << "No gamepad input is available"sv;
-      }
+    {
+      // Hold the probe lock across the shutdown check and the probes so the shutdown thread
+      // cannot release the display guard between them.
+      std::lock_guard probe_lock {startup_probe_mutex};
 
-      if (video::probe_encoders()) {
-        BOOST_LOG(error) << "Video failed to find working encoder"sv;
+      if (shutdown_event->peek()) {
+        // Do not probe encoders or input devices while shutting down. Probing after the display
+        // guard has been released bypasses the no-active-device protection and can delay exit
+        // past the forced-shutdown deadline.
+        auto guard = take_display_guard();
+        guard.reset();
+      } else {
+        if (config::input.controller && input::probe_gamepads()) {
+          BOOST_LOG(warning) << "No gamepad input is available"sv;
+        }
+
+        if (video::probe_encoders()) {
+          BOOST_LOG(error) << "Video failed to find working encoder"sv;
+        }
       }
     }
 
-    if (shutdown_event->peek()) {
+    {
       // Shutdown may have been requested while probing. Release the display guard now instead of
-      // waiting for the end of main.
-      auto guard = take_display_guard();
-      guard.reset();
+      // waiting for the end of main; the probe lock keeps this ordered with the shutdown thread.
+      std::lock_guard probe_lock {startup_probe_mutex};
+      if (shutdown_event->peek()) {
+        auto guard = take_display_guard();
+        guard.reset();
+      }
     }
   }
 
@@ -562,7 +716,7 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
-  if (tray_is_enabled && config::sunshine.system_tray) {
+  if (!shutdown_event->peek() && tray_is_enabled && config::sunshine.system_tray) {
     BOOST_LOG(info) << "Starting system tray"sv;
 #if defined(_WIN32) || defined(__APPLE__)
     system_tray::prepare_tray_virtualhid_license();
@@ -603,7 +757,17 @@ int main(int argc, char *argv[]) {
     });
   }
 
-  mainThreadLoop(shutdown_event);
+  // The shutdown thread may have run end_tray() before the tray was initialized, in which case no
+  // later tray_exit() will wake the tray loop. Do not enter it after shutdown was requested.
+  if (!shutdown_event->peek()) {
+    mainThreadLoop(shutdown_event);
+  }
+
+  if (tray_is_enabled && config::sunshine.system_tray) {
+    // Stop a tray that was initialized after the shutdown thread's end_tray() call. Repeating
+    // end_tray() is safe and also covers a tray loop that exited on its own.
+    system_tray::end_tray();
+  }
 
   permission_watcher.request_stop();
   if (permission_watcher.joinable()) {
@@ -619,11 +783,16 @@ int main(int argc, char *argv[]) {
   configThread.join();
   rtspThread.join();
 
+  // Stop the shutdown thread before the task pool so the forced-shutdown timer stays armed while
+  // end_tray() and display-guard teardown can block.
+  shutdown_thread.request_stop();
+  wake_shutdown_thread();
+  if (shutdown_thread.joinable()) {
+    shutdown_thread.join();
+  }
+
   task_pool.stop();
   task_pool.join();
-
-  // Stop polling for signals before the platform and display guards are destroyed.
-  shutdown_thread.request_stop();
 
 #ifdef _WIN32
   // Restore global NVIDIA control panel settings

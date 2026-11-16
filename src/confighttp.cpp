@@ -2049,6 +2049,9 @@ namespace confighttp {
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    *
+   * @note Returns 503 while startup initialization is still running, because the display
+   *       device state is not available yet.
+   *
    * @api_examples{/api/reset-display-device-persistence|:| POST|:| null}
    */
   void resetDisplayDevicePersistence(const resp_https_t &response, const req_https_t &request) {
@@ -2063,9 +2066,13 @@ namespace confighttp {
 
     print_req(request);
 
-    const bool startup_ready = video::is_startup_ready();
+    if (!video::is_startup_ready()) {
+      service_unavailable(response, "Sunshine is still initializing");
+      return;
+    }
+
     nlohmann::json output_tree;
-    output_tree["status"] = startup_ready && display_device::reset_persistence();
+    output_tree["status"] = display_device::reset_persistence();
     send_response(response, output_tree);
   }
 
@@ -2110,6 +2117,9 @@ namespace confighttp {
    *
    * @param response HTTP response used for authentication or CSRF failures.
    * @param request HTTP request carrying the client identity and CSRF token.
+   *
+   * @note Returns 503 while startup initialization is still running, because a restart would
+   *       interrupt the asynchronous shutdown sequence.
    *
    * @api_examples{/api/restart|:| POST|:| null}
    */
@@ -2330,6 +2340,9 @@ namespace confighttp {
    * @param response HTTP response object.
    * @param request Authenticated HTTP request with a JSON action.
    *
+   * @note Returns 503 for valid requests while startup initialization is still running, because
+   *       license changes update gamepad driver configuration that startup probing reads.
+   *
    * @api_examples{/api/virtual-input/license|:| POST|:| {"action":"validate"}}
    */
   void updateVirtualInputLicense(const resp_https_t &response, const req_https_t &request) {
@@ -2344,37 +2357,42 @@ namespace confighttp {
 
     print_req(request);
 
-    // Activating a license updates the gamepad driver configuration, which the main thread reads
-    // while probing input devices during startup.
-    if (!video::is_startup_ready()) {
-      service_unavailable(response, "Sunshine is still initializing");
-      return;
-    }
-
     try {
       std::stringstream content;
       content << request->content.rdbuf();
       auto input_tree = nlohmann::json::parse(content);
       const auto action = input_tree.value("action", "");
 
-      lvh::LicenseResult result;
+      std::string license_key;
+      std::optional<scoped_sensitive_string_clear_t> clear_license_key;
       if (action == "activate") {
-        auto license_key = input_tree.value("license_key", "");
+        license_key = input_tree.value("license_key", "");
         input_tree["license_key"] = "";
         if (license_key.empty()) {
           bad_request(response, "License key is required");
           return;
         }
+        clear_license_key.emplace(license_key);
+      } else if (action != "validate" && action != "deactivate") {
+        bad_request(response, "Unknown license action");
+        return;
+      }
 
-        const scoped_sensitive_string_clear_t clear_license_key {license_key};
+      // Activating a license updates the gamepad driver configuration, which the main thread reads
+      // while probing input devices during startup. Validate the request first so malformed
+      // requests are rejected consistently regardless of the startup state.
+      if (!video::is_startup_ready()) {
+        service_unavailable(response, "Sunshine is still initializing");
+        return;
+      }
+
+      lvh::LicenseResult result;
+      if (action == "activate") {
         result = lvh::activate_license(license_key);
       } else if (action == "validate") {
         result = lvh::validate_license();
-      } else if (action == "deactivate") {
-        result = lvh::deactivate_license();
       } else {
-        bad_request(response, "Unknown license action");
-        return;
+        result = lvh::deactivate_license();
       }
 
 #ifdef _WIN32

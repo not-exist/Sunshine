@@ -110,6 +110,16 @@ namespace system_tray {
     }
 
     /**
+     * @brief Mutex protecting the tray worker thread object itself.
+     *
+     * @return Mutex guarding assignment, stop requests, and joins of the worker.
+     */
+    std::mutex &tray_worker_mutex() {
+      static std::mutex mutex;
+      return mutex;
+    }
+
+    /**
      * @brief Access the owned tray worker thread.
      *
      * @return Worker thread used by the threaded tray lifecycle.
@@ -820,6 +830,12 @@ namespace system_tray {
   }
 
   void run_tray_until_exit(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) {
+    // The shutdown thread may have handled a signal before the tray was initialized, in which case
+    // its end_tray() call was a no-op and nothing will wake the tray loop later.
+    if (shutdown_event->peek()) {
+      return;
+    }
+
     if (!tray_initialized_state().load()) {
       BOOST_LOG(info) << "System tray is unavailable; continuing without it"sv;
       shutdown_event->view();
@@ -831,6 +847,9 @@ namespace system_tray {
   }
 
   int end_tray() {
+    // The shutdown thread and the main thread may reach the worker object concurrently while the
+    // tray is still being initialized, so assignment, request_stop, and join must be serialized.
+    const std::scoped_lock worker_lock(tray_worker_mutex());
     auto &worker = tray_worker_thread();
     worker.request_stop();
 
@@ -969,6 +988,7 @@ namespace system_tray {
 
   int init_tray_threaded() {
     try {
+      const std::scoped_lock worker_lock(tray_worker_mutex());
       auto &worker = tray_worker_thread();
       if (worker.joinable()) {
         BOOST_LOG(error) << "System tray thread is already running"sv;

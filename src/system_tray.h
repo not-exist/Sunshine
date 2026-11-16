@@ -97,6 +97,8 @@ namespace system_tray {
    *
    * If tray initialization failed, wait for the application's shutdown event instead
    * of stopping its workers. An initialized tray still requests shutdown when its loop exits.
+   * Returns immediately when shutdown was already requested, because a shutdown that ran
+   * before tray initialization cannot wake the tray loop later.
    *
    * @param shutdown_event Event used to stop Sunshine's server threads.
    */

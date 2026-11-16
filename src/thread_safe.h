@@ -199,6 +199,7 @@ namespace safe {
      * @return True while the queue accepts producers and consumers.
      */
     [[nodiscard]] bool running() const {
+      std::lock_guard lg {_lock};
       return _continue;
     }
 
@@ -448,6 +449,7 @@ namespace safe {
      * @return True when a value is available to inspect.
      */
     bool peek() {
+      std::lock_guard lg {_lock};
       return _continue && !_queue.empty();
     }
 
@@ -529,6 +531,7 @@ namespace safe {
      * @return True while the queue accepts producers and consumers.
      */
     [[nodiscard]] bool running() const {
+      std::lock_guard lg {_lock};
       return _continue;
     }
 
@@ -536,7 +539,7 @@ namespace safe {
     bool _continue {true};
     std::uint32_t _max_elements;
 
-    std::mutex _lock;
+    mutable std::mutex _lock;
     std::condition_variable _cv;
 
     std::vector<T> _queue;

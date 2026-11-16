@@ -7,7 +7,7 @@
 // standard includes
 #include <chrono>
 #include <deque>
-#include <latch>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -37,13 +37,32 @@ namespace stream {
 namespace video {
 
   /**
-   * @brief One-shot latch released when the slow startup initialization finishes.
+   * @brief Record the process-wide shutdown event used by the startup readiness checks.
    *
-   * The HTTP and RTSP servers start before display recovery and encoder probing complete. Handlers
-   * that depend on the resulting display and encoder state check this latch instead of delaying
-   * every server from listening.
+   * Called once during startup so request handlers can check readiness without resolving the
+   * mailbox event, which takes the process-wide mailbox mutex, on every request.
+   *
+   * @param shutdown_event Shutdown event shared with the rest of the process.
    */
-  extern std::latch startup_latch;  ///< Shared startup readiness latch.
+  void set_shutdown_event(std::shared_ptr<safe::event_t<bool>> shutdown_event);
+
+  /**
+   * @brief Mark the slow startup initialization as finished.
+   *
+   * The HTTP and RTSP servers start before display recovery and encoder probing complete.
+   * Handlers that depend on the resulting display and encoder state check readiness instead of
+   * delaying every server from listening.
+   */
+  void mark_startup_ready();
+
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Reset startup readiness between tests.
+   *
+   * @param ready Value to store as the readiness state.
+   */
+  void set_startup_ready_for_testing(bool ready);
+#endif
 
   /**
    * @brief Check whether streaming startup initialization finished without blocking.
@@ -57,13 +76,13 @@ namespace video {
   [[nodiscard]] bool is_startup_ready();
 
   /**
-   * @brief Check startup readiness for the supplied latch and shutdown event.
+   * @brief Check startup readiness for the supplied readiness flag and shutdown event.
    *
-   * @param latch Startup latch to inspect.
+   * @param startup_ready Whether startup initialization finished.
    * @param shutdown_event Shutdown event to inspect.
-   * @return True when the latch is ready and shutdown was not requested.
+   * @return True when startup finished and shutdown was not requested.
    */
-  [[nodiscard]] bool is_startup_ready(const std::latch &latch, const safe::event_t<bool> &shutdown_event);
+  [[nodiscard]] bool is_startup_ready(bool startup_ready, const safe::event_t<bool> &shutdown_event);
 
   /**
    * @brief Encoding configuration requested by a remote client.

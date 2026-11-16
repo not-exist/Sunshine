@@ -35,6 +35,7 @@
 #include <src/nvhttp.h>
 #include <src/process.h>
 #include <src/utility.h>
+#include <src/video.h>
 
 #ifdef SUNSHINE_BUILD_PORTAL
   #include <src/platform/linux/misc.h>
@@ -117,6 +118,7 @@ protected:
 
   void SetUp() override {
     BaseTest::SetUp();
+    video::set_startup_ready_for_testing(false);
     nvhttp::expire_pair_sessions(std::chrono::steady_clock::time_point::max());
     confighttp::set_virtual_input_license_status_provider_for_testing([]() {
       lvh::LicenseStatus license;
@@ -338,6 +340,8 @@ protected:
     server->resource["^/virtual-input-status-test$"]["GET"] = confighttp::getVirtualInputStatus;
     server->resource["^/virtual-input-license-test$"]["GET"] = confighttp::getVirtualInputLicense;
     server->resource["^/virtual-input-license-test$"]["POST"] = confighttp::updateVirtualInputLicense;
+    server->resource["^/restart-test$"]["POST"] = confighttp::restart;
+    server->resource["^/reset-display-persistence-test$"]["POST"] = confighttp::resetDisplayDevicePersistence;
     server->resource["^/permissions-test$"]["GET"] = confighttp::getPermissions;
     server->resource["^/permissions-test$"]["POST"] = confighttp::requestPermission;
     server->resource["^/pairing-test$"]["DELETE"] = confighttp::cancelPairing;
@@ -381,6 +385,7 @@ protected:
     confighttp::reset_virtual_input_license_status_provider_for_testing();
     confighttp::reset_permission_statuses_for_testing();
     confighttp::reset_portal_token_path_provider_for_testing();
+    video::set_startup_ready_for_testing(false);
 
     config::sunshine.username = saved_username;
     config::sunshine.password = saved_password;
@@ -1842,6 +1847,59 @@ TEST_F(ConfigHttpTest, VirtualInputLicenseReturnsCurrentStatus) {
   EXPECT_TRUE(body.at("licensed").get<bool>());
   EXPECT_EQ(body.at("active_devices").get<unsigned int>(), 2U);
   EXPECT_EQ(body.at("message").get<std::string>(), "Test license status");
+}
+
+TEST_F(ConfigHttpTest, RestartReturns503WhileStartupInitializationIsRunning) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
+
+  const auto response = client->request("POST", "/restart-test", "", headers);
+  ASSERT_EQ(response->status_code, "503 Service Unavailable");
+  const auto body = nlohmann::json::parse(response->content.string());
+  EXPECT_FALSE(body.at("status").get<bool>());
+  EXPECT_EQ(body.at("error").get<std::string>(), "Sunshine is still initializing");
+}
+
+TEST_F(ConfigHttpTest, ResetDisplayDevicePersistenceReturns503WhileStartupInitializationIsRunning) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
+
+  const auto response = client->request("POST", "/reset-display-persistence-test", "", headers);
+  ASSERT_EQ(response->status_code, "503 Service Unavailable");
+  const auto body = nlohmann::json::parse(response->content.string());
+  EXPECT_FALSE(body.at("status").get<bool>());
+  EXPECT_EQ(body.at("error").get<std::string>(), "Sunshine is still initializing");
+}
+
+TEST_F(ConfigHttpTest, UpdateVirtualInputLicenseReturns503WhileStartupInitializationIsRunning) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
+
+  const auto response = client->request("POST", "/virtual-input-license-test", R"({"action":"validate"})", headers);
+  ASSERT_EQ(response->status_code, "503 Service Unavailable");
+  EXPECT_TRUE(response->content.string().contains("Sunshine is still initializing"));
+}
+
+// Test: malformed license requests are rejected before the readiness gate so clients always get 400.
+TEST_F(ConfigHttpTest, UpdateVirtualInputLicenseValidatesBeforeStartupGate) {
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
+
+  const auto invalid_json = client->request("POST", "/virtual-input-license-test", "not-json", headers);
+  EXPECT_EQ(invalid_json->status_code, "400 Bad Request");
+  EXPECT_TRUE(invalid_json->content.string().contains("Invalid license request"));
+
+  const auto unknown_action = client->request("POST", "/virtual-input-license-test", R"({"action":"unknown"})", headers);
+  EXPECT_EQ(unknown_action->status_code, "400 Bad Request");
+  EXPECT_TRUE(unknown_action->content.string().contains("Unknown license action"));
+
+  const auto empty_key = client->request("POST", "/virtual-input-license-test", R"({"action":"activate","license_key":""})", headers);
+  EXPECT_EQ(empty_key->status_code, "400 Bad Request");
+  EXPECT_TRUE(empty_key->content.string().contains("License key is required"));
 }
 
 // Test: every public license state maps to a stable Web UI state string

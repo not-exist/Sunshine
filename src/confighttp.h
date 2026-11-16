@@ -194,6 +194,22 @@ namespace confighttp {
 
   void updateVirtualInputLicense(const resp_https_t &response, const req_https_t &request);
 
+  /**
+   * @brief Restart Sunshine from the Web UI.
+   *
+   * @param response HTTPS response used for authentication or CSRF failures.
+   * @param request Authenticated, CSRF protected request.
+   */
+  void restart(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Reset the display device persistence state.
+   *
+   * @param response HTTPS response receiving the status JSON.
+   * @param request Authenticated, CSRF protected request.
+   */
+  void resetDisplayDevicePersistence(const resp_https_t &response, const req_https_t &request);
+
   void resetPortalToken(const resp_https_t &response, const req_https_t &request);
 
   /**
