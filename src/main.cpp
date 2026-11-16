@@ -294,9 +294,21 @@ int main(int argc, char *argv[]) {
   // recovery does not delay the Web UI. Signal handlers clear it through this mutex.
   std::unique_ptr<platf::deinit_t> display_device_deinit_guard;
   std::mutex display_guard_mutex;
-  auto reset_display_guard = [&]() {
+  auto take_display_guard = [&]() {
     std::lock_guard lock {display_guard_mutex};
-    display_device_deinit_guard.reset();
+    return std::move(display_device_deinit_guard);
+  };
+  auto reset_display_guard = [&]() {
+    // The signal handler must never block on this mutex: it can interrupt the main thread while
+    // the main thread holds it. try_lock leaves cleanup to the main thread in that case.
+    std::unique_lock lock {display_guard_mutex, std::try_to_lock};
+    if (!lock.owns_lock()) {
+      return;
+    }
+
+    auto guard = std::move(display_device_deinit_guard);
+    lock.unlock();
+    guard.reset();
   };
 
 #ifdef _WIN32
@@ -479,7 +491,7 @@ int main(int argc, char *argv[]) {
   std::jthread configThread {confighttp::start};
   std::jthread rtspThread {rtsp_stream::start};
 
-  BOOST_LOG(info) << "Startup: HTTP servers listening; continuing display and encoder initialization"sv;
+  BOOST_LOG(info) << "Startup: starting HTTP servers; continuing display and encoder initialization"sv;
 
   const auto startup_init_begin = std::chrono::steady_clock::now();
 
@@ -499,10 +511,14 @@ int main(int argc, char *argv[]) {
           BOOST_LOG(error) << "Display device session failed to initialize"sv;
         }
 
-        std::lock_guard lock {display_guard_mutex};
-        display_device_deinit_guard = std::move(guard);
+        {
+          std::lock_guard lock {display_guard_mutex};
+          display_device_deinit_guard = std::move(guard);
+        }
+
         if (shutdown_event->peek()) {
-          display_device_deinit_guard.reset();
+          auto guard = take_display_guard();
+          guard.reset();
         }
       }
 
@@ -607,8 +623,8 @@ int main(int argc, char *argv[]) {
 #endif
 
   {
-    std::lock_guard lock {display_guard_mutex};
-    display_device_deinit_guard.reset();
+    auto guard = take_display_guard();
+    guard.reset();
   }
 
   return lifetime::desired_exit_code;
