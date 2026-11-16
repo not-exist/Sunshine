@@ -61,3 +61,6 @@ junit.xml
 *.pyc
 .venv/
 venv/
+
+# Local implementation plans
+/docs/maintainers/plans/
