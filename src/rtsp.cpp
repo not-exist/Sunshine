@@ -1030,6 +1030,12 @@ namespace rtsp_stream {
     auto seqn_str = std::to_string(req->sequenceNumber);
     option.content = const_cast<char *>(seqn_str.c_str());
 
+    if (!video::startup_latch.wait_for()) {
+      respond(sock, session, &option, 503, "SERVICE UNAVAILABLE", req->sequenceNumber, {});
+
+      return;
+    }
+
     std::string_view payload {req->payload, (size_t) req->payloadLength};
 
     std::vector<std::string_view> lines;
